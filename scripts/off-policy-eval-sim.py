@@ -12,8 +12,11 @@ import argparse
 import yaml
 import traceback
 import math
+import copy
 
+import pandas as pd
 import numpy as np
+from scipy.special import expit
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -89,7 +92,7 @@ def get_optimizer(config, parameters):
             'Optimizer {} not understood.'.format(config.optim.optimizer))
         
 @torch.no_grad()
-def test(model, dataloader, epoch, args, device):
+def test(model, dataloader, epoch, args, config, device):
     model.eval()
     logprobs = []
 
@@ -109,7 +112,7 @@ def test(model, dataloader, epoch, args, device):
     logprob_mean, logprob_std = logprobs.mean(0), 2 * logprobs.var(0).sqrt() / math.sqrt(len(dataloader.dataset))
     output = 'Evaluate ' + (epoch != None)*'(epoch {}) -- '.format(epoch) + 'logp(x) = {:.3f} +/- {:.3f}'.format(logprob_mean, logprob_std)
     print(output)
-    results_file = os.path.join(args.out_dir, 'results.txt')
+    results_file = os.path.join(config.out_dir, 'results.txt')
     print(output, file=open(results_file, 'a'))
     return logprob_mean, logprob_std
 
@@ -174,17 +177,17 @@ def train(args, config, dataloaders, device):
 
         # now evaluate and save metrics/checkpoints
         eval_logprob, _ = test(
-            model, test_dataloader, epoch, args, device)
+            model, test_dataloader, epoch, args, config, device)
 
         torch.save({
             'epoch': epoch,
             'model_state': model.module.state_dict(),
             'optimizer_state': optimizer.state_dict()},
-            os.path.join(args.out_dir, 'model_checkpoint.pt'))
+            os.path.join(config.out_dir, 'model_checkpoint.pt'))
         # save model only
         torch.save(
             model.state_dict(), os.path.join(
-                args.out_dir, 'model_state.pt'))
+                config.out_dir, 'model_state.pt'))
         # save best state
         if eval_logprob > best_eval_logprob:
             best_eval_logprob = eval_logprob
@@ -193,7 +196,7 @@ def train(args, config, dataloaders, device):
                 'epoch': epoch,
                 'model_state': model.module.state_dict(),
                 'optimizer_state': optimizer.state_dict()},
-                os.path.join(args.out_dir, 'best_model_checkpoint.pt'))
+                os.path.join(config.out_dir, 'best_model_checkpoint.pt'))
 
 
 class Gaussian(Dataset):
@@ -413,17 +416,17 @@ def set_up_args_and_configs(args):
 
     """
     args = dict2namespace(args)
-    with open(os.path.join('configs', args.config), 'r') as f:
+    with open(os.path.abspath(args.config), 'r') as f:
         config = yaml.safe_load(f)
     new_config = dict2namespace(config)
     
-    args.out_dir = os.path.join(new_config.training.out_dir, args.exp_id)
-    print(os.path.exists(args.out_dir))
-    if not os.path.exists(args.out_dir):
-        print(args.out_dir)
-        os.makedirs(args.out_dir, exist_ok=True)
-    args.log_path = os.path.join(args.out_dir, 'logs')
-    os.makedirs(args.out_dir, exist_ok=True)
+    new_config.out_dir = os.path.join(new_config.training.out_dir, new_config.training.exp_id)
+    print(os.path.exists(new_config.out_dir))
+    if not os.path.exists(new_config.out_dir):
+        print(new_config.out_dir)
+        os.makedirs(new_config.out_dir, exist_ok=True)
+    args.log_path = os.path.join(new_config.out_dir, 'logs')
+    os.makedirs(new_config.out_dir, exist_ok=True)
     
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -432,7 +435,7 @@ def set_up_args_and_configs(args):
         
     return args, new_config
 
-# Generate data
+## Data generating processes
 def generate_data(**kwargs):
     args = kwargs
     C = np.random.binomial(n=args['C_cardinality'] - 1, size=(args['n'], 1), p=.5)
@@ -456,6 +459,61 @@ def generate_data(**kwargs):
     data = {"logging":{"C": C, "A": A_logging, "Y": Y_logging, "AC": AC_logging}, "target": {"C": C, "A": A_target, "AC":AC_target, "Y": Y_target}}
 
     return data
+
+
+def generate_embedded_AC_data(**kwargs):
+    args = kwargs
+
+    C_latent = np.random.binomial(n=1, size=(args['n']), p=.5)
+    C = C_latent * np.random.normal(loc=-.5, scale=1, size=args['n']) + (1-C_latent) * np.random.normal(loc=.5, scale=1, size=args['n'])
+    print(C.shape)
+    A_logging_means = (np.array([[.2], [-.2]]) + C ).T
+    print(A_logging_means.shape)
+    A_logging = np.vstack([np.random.multivariate_normal(mean=A_logging_means[i, :],
+                                                  cov=args['A_scale'] * np.array([[1, .3], [.3, 1]]), size=1) for i in range(A_logging_means.shape[0])])
+    print(A_logging.shape)
+
+    A_target_means = (np.array([[0], [0]]) + C ).T
+    A_target = np.vstack([np.random.multivariate_normal(mean=x,
+                                                 cov=args['A_scale'] * np.array([[1, .3], [.3, 1]]), size=1) for x in A_target_means])
+    Y_logging = np.random.normal(loc=A_logging @ args['Y_coef'] + C.reshape(-1), scale=args['Y_scale'])
+
+    Y_target = np.random.normal(loc=A_target @ args['Y_coef'] + C.reshape(-1), scale=args['Y_scale'])
+    AC_logging = get_kronecker_prod(A_logging, C.reshape(-1, 1))
+    AC_target = get_kronecker_prod(A_target, C.reshape(-1, 1))
+    data = {"logging":{"C": C, "A": A_logging, "Y": Y_logging, "AC": AC_logging}, "target": {"C": C, "A": A_target, "AC":AC_target, "Y": Y_target}}
+
+    return data
+
+def generate_modified_kang_schafer_data(**kwargs):
+
+    args = kwargs
+
+    C = np.random.multivariate_normal(mean=np.zeros(4), cov=np.eye(4), size=args['n'])
+
+    beta_1 = np.array([[1, -.5, .25, .1],
+                       [.4, .3, .24, .2],
+                       [.3, .2, .3, .1],
+                       [-2, 1, .5, .3]])
+    beta_2 = np.array([[.1, -.5, -.25, -.1],
+                       [-.4, .8, -.34, .2],
+                       [-.8, .9, -.3, 1],
+                       [-2, 1, -.2, 3]])
+    A_logging = C @ beta_1 + np.random.multivariate_normal(mean=np.zeros(4), cov=np.eye(4), size=args['n'])
+    A_target =  C @ beta_2 + np.random.multivariate_normal(mean=np.zeros(4), cov=np.eye(4), size=args['n'])
+
+    gamma_1 = np.array([27.4, 13.7, 13.7, 13.7])
+    Y_logging = 210 + 10 * np.sum((A_logging), axis=1).reshape(-1) + (C @ gamma_1).reshape(-1) + np.random.normal(size=args['n'])
+    Y_target = 210 + 8 * np.sum((A_target), axis=1).reshape(-1) + (C @ gamma_1).reshape(-1) + np.random.normal(size=args['n'])
+
+    AC_logging = get_kronecker_prod(A_logging, C)
+    AC_target = get_kronecker_prod(A_target, C)
+    data = {"logging":{"C": C, "A": A_logging, "Y": Y_logging, "AC": AC_logging}, "target": {"C": C, "A": A_target, "AC":AC_target, "Y": Y_target}}
+
+    return data
+
+
+## Estimators
 
 def get_kronecker_prod(A, C):
     i, j = C.shape
@@ -522,20 +580,29 @@ def get_transformed_data(model, data):
 
     """
 
-    transformed_data = data.copy()
+    transformed_data = copy.deepcopy(data)
     for policy_type in ["logging", "target"]:
         transformed_actions, _ = model.forward(torch.from_numpy(data[policy_type]["AC"]).float().to(device))
         transformed_actions = transformed_actions.detach().cpu().numpy() # convert to numpy array
         transformed_data[policy_type]["AC"] = transformed_actions
     return transformed_data
 
+def get_bootstrapped_data(data, ix):
+    new_data = copy.deepcopy(data)
+    def _get_bootstrapped_data(d):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                d[k] = _get_bootstrapped_data(v)
+            else:
+                d[k] = v[ix]
+        return d
 
+    return _get_bootstrapped_data(new_data)
 
 if __name__ == "__main__":
 
     # Set up args and devices
-    args_dict = {'config': '/Users/jaron/Projects/f-dre/src/configs/flows/gmm/maf_copy.yaml',
-            'exp_id': 'featurized_ope',
+    args_dict = {'config': '../src/configs/flows/gmm/maf_copy.yaml',
             'resume_training': False,
             'restore_file': False,
             'seed': 1234,
@@ -545,41 +612,61 @@ if __name__ == "__main__":
 
     # Generate simulation data:
     # In this step we create data from simulated logging and target policies.
+
+    # Specify data simulation params
     params = {'n': 5000,
               'Y_coef': np.array([1, 1]),
               'A_scale': .01,
               'Y_scale': .01,
               'embedding_dim': 1,
               'C_cardinality': 2,
-              'eps': 10}
-    data = generate_data(**params)
-    print(data)
+              'eps': 10
+              }
+
+    data = generate_modified_kang_schafer_data(**params)
 
 
     # Train Normalizing Flow Model
     ## Load data to train
-    dataloaders = get_ordinary_dataloaders(args, config, device, data)
+    if not config.training.use_cached:
+        dataloaders = get_ordinary_dataloaders(args, config, device, data)
 
-    ## Train model
-    train(args, config, dataloaders, device)
+        ## Train model
+        train(args, config, dataloaders, device)
 
     # Fit density ratio model
-    ## Generate data from action space and compute true density ratios
-    #actions = torch.cat([data['logging']['AC'], data['target']['AC']])
+
 
     ## Use normalizing flow model to transform actions
     model = get_model(config)
-    restore_file = '/Users/jaron/Projects/f-dre/src/flows/results/{}/'.format(args.exp_id)
+    restore_file = os.path.abspath('../src/flows/results/{}/'.format(config.training.exp_id))
     state = torch.load(os.path.join(restore_file, "best_model_checkpoint.pt"), map_location='cpu')
     model.load_state_dict(state['model_state'])
     model = model.to(device)
     model.eval()
 
     # Get MAF transformed actions
-    transformed_data = get_transformed_data(model, data)
 
     # Compute BOPE estimator
-    results = permutation_estimator(data)
-    print(results["result"])
-    transformed_results = permutation_estimator(transformed_data)
-    print(transformed_results["result"])
+    data_list = []
+    for i in range(config.estimation.bootstraps):
+        ix = np.random.choice(a=params['n'], size=params['n'])
+        temp_data = get_bootstrapped_data(data, ix)
+        transformed_temp_data = get_transformed_data(model, temp_data)
+        pw_estimate = permutation_estimator(temp_data)["result"]
+        f_pw_estimate = permutation_estimator(transformed_temp_data)["result"]
+        target = np.mean(temp_data["target"]["Y"])
+        logging = np.mean(temp_data["logging"]["Y"])
+
+        results = {"pw_estimate": pw_estimate, "f_pw_estimate": f_pw_estimate,
+                   "target": target, "logging": logging}
+        data_list.append(results)
+
+    results_df = pd.DataFrame(data_list)
+
+    results_df.to_csv(os.path.join(os.path.abspath('../src/flows/results/{}/'.format(config.training.exp_id)), "estimates.csv"))
+
+
+
+
+

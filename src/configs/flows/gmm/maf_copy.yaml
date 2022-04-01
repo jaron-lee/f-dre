@@ -4,24 +4,16 @@ training:
   ngpu: 1
   log_interval: 500
   iter_save: 100
-  exp_id: "gmm_flow"
+  exp_id: "featurized_ope"
   out_dir: "/Users/jaron/Projects/f-dre/src/flows/results"
   data_dir: "/Users/jaron/Projects/f-dre/data/"
+  use_cached: True
 
 data:
-  dataset: "GMM_flow"
   perc: 1.0
   mus: [0, 3]
   input_size: 2
   num_workers: 4
-  flip_toy_var_order: true
-
-dre:
-  alpha: 0.06
-
-sampling:
-  n_samples: 50000
-  # sir: 1000
 
 model:
   name: "maf"
@@ -29,7 +21,7 @@ model:
   n_classes: 2
   n_blocks: 5
   n_components: 1
-  input_size: 2
+  input_size: 16
   hidden_size: 100
   n_hidden: 1
   activation_fn: 'relu'
@@ -50,5 +42,6 @@ optim:
 loss:
   name: "cross_entropy"
 
-
+estimation:
+  bootstraps: 10
 
